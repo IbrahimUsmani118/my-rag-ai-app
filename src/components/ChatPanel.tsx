@@ -2,7 +2,6 @@ import { MessageCircle, Send } from 'lucide-react';
 import { SkeletonLoader } from './SkeletonLoader';
 import { SourcesPanel } from './SourcesPanel';
 import { MessageWithCitations } from './MessageWithCitations';
-import { useStreamingText } from '../hooks/useStreamingText';
 import type { SourceItem } from '../lib/api';
 
 export interface ChatMessage {

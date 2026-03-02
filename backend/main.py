@@ -1,16 +1,35 @@
 import json
 import os
-import re
+import tempfile
+from typing import Any
 
+from chromadb import PersistentClient
+from chromadb.utils import embedding_functions
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, File, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from groq import Groq
+from fastapi.responses import JSONResponse, StreamingResponse
 from openai import OpenAI
-from pinecone import Pinecone
 from pydantic import BaseModel
+from sentence_transformers import CrossEncoder
+
+from ingest import ingest_pdf
 
 load_dotenv()
+
+# Cross-Encoder for reranking: score (query, chunk) pairs and keep top-k
+RERANKER_MODEL = "cross-encoder/ms-marco-MiniLM-L6-v2"
+RERANK_TOP_K = 3
+VECTOR_STORE_TOP_K = 10
+
+_cross_encoder: CrossEncoder | None = None
+
+
+def get_reranker() -> CrossEncoder:
+    global _cross_encoder
+    if _cross_encoder is None:
+        _cross_encoder = CrossEncoder(RERANKER_MODEL)
+    return _cross_encoder
 
 app = FastAPI()
 
@@ -22,90 +41,114 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Pinecone
-pc = Pinecone(api_key=os.getenv("VITE_PINECONE_API_KEY"))
-pinecone_index = pc.Index(os.getenv("VITE_PINECONE_INDEX_NAME"))
+# ChromaDB (same path and collection as ingest.py)
+CHROMA_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "chroma_data"))
+COLLECTION_NAME = "docs"
+OPENAI_EMBED_MODEL = "text-embedding-3-small"
+OPENAI_CHAT_MODEL = "gpt-4o-mini"
 
-# Groq
-groq_client = Groq(api_key=os.getenv("VITE_GROQ_API_KEY"))
-
-# OpenAI (for embeddings; must match model used when indexing chunks)
 openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+ef = embedding_functions.OpenAIEmbeddingFunction(
+    api_key=os.getenv("OPENAI_API_KEY"),
+    model_name=OPENAI_EMBED_MODEL,
+)
+chroma_client = PersistentClient(path=CHROMA_PATH)
 
-EMBEDDING_MODEL = "text-embedding-3-small"
+# Prompt template for RAG: context + question -> answer
+PROMPT_TEMPLATE = """Answer ONLY using the provided context below. If the answer is not in the context, say you don't know. Cite your sources using [1], [2], etc. for each claim.
 
-# Chunk metadata as extracted from Pinecone (include_metadata=True)
-ChunkMeta = dict  # chunk_id, text, filename, page, score
+Context:
+{context}
+
+---
+
+Question: {question}"""
 
 
-def get_embedding(text: str) -> list[float]:
-    """Generate embedding for text using OpenAI (same model as indexed chunks)."""
-    response = openai_client.embeddings.create(
-        model=EMBEDDING_MODEL,
-        input=text.strip(),
+def get_collection():
+    return chroma_client.get_or_create_collection(
+        name=COLLECTION_NAME,
+        embedding_function=ef,
+        metadata={"hnsw:space": "cosine"},
     )
-    return response.data[0].embedding
 
 
-def _parse_meta(match: object) -> ChunkMeta:
-    mid = getattr(match, "id", None) or (match.get("id") if isinstance(match, dict) else None)
-    score = getattr(match, "score", None) or (match.get("score") if isinstance(match, dict) else None)
-    meta = getattr(match, "metadata", None) or (match.get("metadata") or {})
-    if not isinstance(meta, dict):
-        meta = {}
-    text = meta.get("text", "").strip()
-    filename = meta.get("filename") or meta.get("source") or "document.pdf"
+def _parse_chunk(doc_id: str, text: str, meta: dict, dist: float) -> dict[str, Any]:
+    """Build a chunk dict with metadata; confidence from vector distance (before rerank)."""
+    filename = meta.get("filename") or "document.pdf"
     page = meta.get("page")
     if isinstance(page, str) and page.isdigit():
         page = int(page)
-    confidence = min(100.0, max(0.0, (float(score) if score is not None else 0.85) * 100.0))
+    confidence = max(0.0, min(100.0, 100.0 * (1.0 - (float(dist) / 2.0))))
     return {
-        "chunk_id": mid or "",
-        "text": text,
+        "chunk_id": doc_id,
+        "text": text or "",
         "filename": filename,
         "page": page,
         "confidence": round(confidence, 1),
+        "text_snippet": (text or "")[:500] + ("..." if len(text or "") > 500 else ""),
     }
 
 
-def rerank_chunks(question: str, chunks: list[ChunkMeta]) -> list[ChunkMeta]:
-    """Use LLM to keep only chunks that are actually relevant to the question (re-ranker pattern)."""
-    if len(chunks) <= 1:
-        return chunks
-    # Short preview per chunk (first 250 chars) so the re-ranker is fast
-    previews = "\n\n".join(
-        f"[{i}] {c['text'][:250]}{'...' if len(c['text']) > 250 else ''}"
-        for i, c in enumerate(chunks, 1)
+def retrieve_and_rerank(collection, question: str) -> tuple[str, list[dict[str, Any]]]:
+    """
+    Fetch 10 chunks from the vector store, score with Cross-Encoder, return context and
+    source metadata for the top 3 highest-scoring chunks.
+    """
+    results = collection.query(
+        query_texts=[question],
+        n_results=VECTOR_STORE_TOP_K,
+        include=["documents", "metadatas", "distances"],
     )
-    prompt = f"""Question: {question}
+    docs = results["documents"][0] if results["documents"] else []
+    metadatas = results["metadatas"][0] if results["metadatas"] else []
+    ids = results["ids"][0] if results["ids"] else []
+    distances = results["distances"][0] if results["distances"] else [0.0] * len(docs)
 
-Chunks (numbered 1 to {len(chunks)}):
-{previews}
+    if not docs:
+        return "", []
 
-Which chunk numbers are relevant to answering the question? Reply with ONLY a JSON array of relevant numbers, e.g. [1, 3, 5]. If none are relevant, reply []."""
+    # Build candidate chunks
+    candidates = []
+    for doc_id, text, meta, dist in zip(
+        ids, docs, metadatas or [{}] * len(docs), distances or [0.0] * len(docs)
+    ):
+        meta = meta or {}
+        candidates.append(_parse_chunk(doc_id, text or "", meta, float(dist or 0)))
 
-    try:
-        completion = groq_client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0,
-            max_tokens=80,
-        )
-        raw = (completion.choices[0].message.content or "").strip()
-        # Extract JSON array
-        arr_match = re.search(r"\[[\d,\s]*\]", raw)
-        if not arr_match:
-            return chunks
-        indices = json.loads(arr_match.group())
-        if not isinstance(indices, list):
-            return chunks
-        # 1-based to 0-based; filter to valid indices
-        keep = {int(i) for i in indices if isinstance(i, (int, float)) and 1 <= int(i) <= len(chunks)}
-        if not keep:
-            return chunks
-        return [chunks[i - 1] for i in sorted(keep)]
-    except (json.JSONDecodeError, ValueError, KeyError):
-        return chunks
+    # Cross-Encoder rerank: score (query, passage) pairs
+    pairs = [(question, c["text"]) for c in candidates]
+    reranker = get_reranker()
+    scores = reranker.predict(pairs)
+
+    # Sort by score descending and take top RERANK_TOP_K
+    indexed = list(zip(scores, candidates))
+    indexed.sort(key=lambda x: x[0], reverse=True)
+    top = [c for _, c in indexed[:RERANK_TOP_K]]
+
+    # Normalize rerank scores (among top-k) to 0–100 for confidence display
+    top_scores = [indexed[i][0] for i in range(len(top))]
+    if len(top) > 1 and min(top_scores) != max(top_scores):
+        lo, hi = min(top_scores), max(top_scores)
+        for i, c in enumerate(top):
+            c["confidence"] = round(100.0 * (top_scores[i] - lo) / (hi - lo), 1)
+    elif top:
+        top[0]["confidence"] = 100.0
+
+    # Build context and sources (renumbered [1], [2], [3])
+    context_parts = [f"[{i}]\n{c['text']}" for i, c in enumerate(top, 1)]
+    context = "\n\n".join(context_parts)
+    sources = [
+        {
+            "chunk_id": c["chunk_id"],
+            "filename": c["filename"],
+            "page": c["page"],
+            "confidence": c["confidence"],
+            "text_snippet": c["text_snippet"],
+        }
+        for c in top
+    ]
+    return context, sources
 
 
 class QueryRequest(BaseModel):
@@ -113,18 +156,16 @@ class QueryRequest(BaseModel):
 
 
 class SourceItem(BaseModel):
-    """Source attribution metadata for one citation [1], [2], etc."""
+    """Metadata for one retrieved chunk: filename and page from ChromaDB, plus confidence and snippet."""
 
     chunk_id: str
-    filename: str
-    page: int | None
+    filename: str  # from ChromaDB metadata
+    page: int | None  # from ChromaDB metadata
     confidence: float  # 0-100
-    text_snippet: str  # original text snippet for attribution
+    text_snippet: str
 
 
 class QueryResponse(BaseModel):
-    """JSON response: answer string and array of source objects per citation."""
-
     response: str
     chunk_ids: list[str]
     sources: list[SourceItem]
@@ -141,72 +182,128 @@ def query(request: QueryRequest):
     if not question:
         return QueryResponse(response="Please provide a question.", chunk_ids=[], sources=[])
 
-    # 1. Embed query
-    query_embedding = get_embedding(question)
+    collection = get_collection()
+    context, sources_dicts = retrieve_and_rerank(collection, question)
 
-    # 2. Query Pinecone with include_metadata=True (filename, page, text snippet)
-    query_result = pinecone_index.query(
-        vector=query_embedding,
-        top_k=5,
-        include_metadata=True,
-    )
-    matches = getattr(query_result, "matches", []) or query_result.get("matches", [])
-
-    if not matches:
+    if not context:
         return QueryResponse(
-            response="No relevant documents were found to answer your question. Try uploading documents first or rephrasing.",
+            response="No relevant documents were found. Ingest PDFs first using the ingest script.",
             chunk_ids=[],
             sources=[],
         )
 
-    # 3. Extract metadata: filename, page, original text snippet
-    chunks: list[ChunkMeta] = [_parse_meta(m) for m in matches if _parse_meta(m).get("chunk_id")]
-
-    # 4. Re-ranker: keep only chunks the LLM deems relevant
-    chunks = rerank_chunks(question, chunks)
-
-    if not chunks:
-        return QueryResponse(
-            response="No relevant passages could be used to answer this question. Try rephrasing or uploading more documents.",
-            chunk_ids=[],
-            sources=[],
-        )
-
-    # 5. Build context for Groq (strict prompt + citation instruction)
-    context_parts = [f"[{i}]\n{c['text']}" for i, c in enumerate(chunks, 1)]
-    context = "\n\n".join(context_parts)
-
-    system_prompt = """Answer ONLY using the provided context. If the answer isn't there, say you don't know. Cite your sources using [1], [2] notation for each claim."""
-
-    user_prompt = f"""Context:
-
-{context}
-
----
-
-Question: {question}"""
-
-    completion = groq_client.chat.completions.create(
-        model="llama-3.1-8b-instant",
+    prompt = PROMPT_TEMPLATE.format(context=context, question=question)
+    completion = openai_client.chat.completions.create(
+        model=OPENAI_CHAT_MODEL,
         messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
+            {"role": "system", "content": "You answer questions based only on the provided context. Cite sources with [1], [2] notation."},
+            {"role": "user", "content": prompt},
         ],
         temperature=0.2,
     )
     answer = completion.choices[0].message.content or ""
 
-    # 6. Return JSON: answer + sources array (metadata for each citation [1], [2], ...)
-    chunk_ids = [c["chunk_id"] for c in chunks]
-    sources = [
-        SourceItem(
-            chunk_id=c["chunk_id"],
-            filename=c["filename"],
-            page=c.get("page"),
-            confidence=c["confidence"],
-            text_snippet=c["text"][:500] + ("..." if len(c["text"]) > 500 else ""),
-        )
-        for c in chunks
-    ]
-
+    sources = [SourceItem(**s) for s in sources_dicts]
+    chunk_ids = [s["chunk_id"] for s in sources_dicts]
     return QueryResponse(response=answer, chunk_ids=chunk_ids, sources=sources)
+
+
+@app.post("/query/stream")
+def query_stream(request: QueryRequest):
+    """Stream the assistant reply as newline-delimited JSON chunks: {"delta": "..."} then {"sources": [...]}."""
+    question = request.question.strip()
+    if not question:
+        def empty():
+            yield json.dumps({"delta": ""}) + "\n"
+        return StreamingResponse(empty(), media_type="application/x-ndjson")
+
+    collection = get_collection()
+    context, sources = retrieve_and_rerank(collection, question)
+
+    if not context:
+        def no_docs():
+            yield json.dumps({"delta": "No relevant documents were found. Ingest PDFs first using the ingest script."}) + "\n"
+            yield json.dumps({"sources": []}) + "\n"
+        return StreamingResponse(no_docs(), media_type="application/x-ndjson")
+
+    prompt = PROMPT_TEMPLATE.format(context=context, question=question)
+
+    def generate():
+        stream = openai_client.chat.completions.create(
+            model=OPENAI_CHAT_MODEL,
+            messages=[
+                {"role": "system", "content": "You answer questions based only on the provided context. Cite sources with [1], [2] notation."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.2,
+            stream=True,
+        )
+        for chunk in stream:
+            if chunk.choices and chunk.choices[0].delta.content:
+                yield json.dumps({"delta": chunk.choices[0].delta.content}) + "\n"
+        yield json.dumps({"sources": sources}) + "\n"
+
+    return StreamingResponse(generate(), media_type="application/x-ndjson")
+
+
+@app.get("/documents")
+def list_documents():
+    """Return unique document filenames stored in ChromaDB."""
+    collection = get_collection()
+    try:
+        data = collection.get(include=["metadatas"], limit=100_000)
+    except Exception:
+        return {"documents": []}
+    metadatas = data.get("metadatas") or []
+    seen = set()
+    names = []
+    for m in metadatas:
+        if not isinstance(m, dict):
+            continue
+        name = m.get("filename")
+        if name and name not in seen:
+            seen.add(name)
+            names.append(name)
+    return {"documents": sorted(names)}
+
+
+@app.post("/documents/upload")
+def upload_document(file: UploadFile = File(...)):
+    """Upload a PDF: chunk it, embed, and add to ChromaDB. Returns chunk count and filename."""
+    if not file.filename or not file.filename.lower().endswith(".pdf"):
+        return JSONResponse(
+            content={"error": "Only PDF files are allowed", "chunks": 0},
+            status_code=400,
+        )
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+            content = file.file.read()
+            tmp.write(content)
+            tmp_path = tmp.name
+        try:
+            n = ingest_pdf(tmp_path, filename=file.filename)
+            return {"filename": file.filename, "chunks": n}
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+    except Exception as e:
+        return JSONResponse(
+            content={"error": str(e), "chunks": 0},
+            status_code=500,
+        )
+
+
+@app.delete("/documents")
+def delete_document(filename: str = Query(..., description="Filename to remove from the index")):
+    """Delete all chunks for the given document filename."""
+    collection = get_collection()
+    try:
+        data = collection.get(where={"filename": {"$eq": filename}}, include=[])
+    except Exception:
+        return {"deleted": 0}
+    ids_to_delete = data.get("ids") or []
+    if ids_to_delete:
+        collection.delete(ids=ids_to_delete)
+    return {"deleted": len(ids_to_delete)}

@@ -4,6 +4,8 @@ RAG (Retrieval-Augmented Generation) chat: ask questions over your documents wit
 
 ## Run locally
 
+**Python:** The backend uses ChromaDB, which does not support Python 3.14+. Use **Python 3.12 or 3.11**. On macOS: `brew install python@3.12`. If you already have a venv on 3.14, remove it and re-run: `rm -rf backend/.venv && npm run start`.
+
 ### One-command start (venv + backend + build + frontend)
 
 From the project root:
@@ -26,7 +28,7 @@ Press `Ctrl+C` to stop the frontend; the script will also stop the backend.
 
 ### Run backend and frontend separately
 
-#### 1. Backend (FastAPI + Pinecone + Groq)
+#### 1. Backend (FastAPI + ChromaDB + OpenAI)
 
 ```bash
 # From project root
@@ -60,7 +62,21 @@ Frontend: **http://localhost:5173**
 2. Ask a question; the app proxies `/api/*` to the backend.
 3. Click citation links like **[1]** in the AI response to open the **Sources** side-panel (filename, page, confidence score).
 
+## Ingesting PDFs (ChromaDB)
+
+Before querying, ingest PDFs so they are chunked and stored in ChromaDB:
+
+```bash
+cd backend
+source .venv/bin/activate   # or: .venv\Scripts\activate on Windows
+python -m ingest path/to/file1.pdf path/to/file2.pdf
+```
+
+- Uses **LangChain RecursiveCharacterTextSplitter**: 800 tokens per chunk, 15% overlap.
+- Text is embedded with OpenAI `text-embedding-3-small` and stored in `backend/chroma_data/`.
+- Requires `OPENAI_API_KEY` in `backend/.env`.
+
 ## Environment
 
-- **Frontend** (root `.env`): `VITE_GROQ_API_KEY`, `VITE_PINECONE_API_KEY`, `VITE_PINECONE_INDEX_NAME` (for any client-side usage).
-- **Backend** (`backend/.env`): same keys plus `OPENAI_API_KEY` for embeddings. Copy values from the root `.env` and add your OpenAI key.
+- **Backend** (`backend/.env`): `OPENAI_API_KEY` (for embeddings and GPT-4o-mini).
+- **Frontend** (root `.env`): optional; the app talks to the backend via the dev proxy.
