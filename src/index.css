@@ -1,0 +1,33 @@
+@import "tailwindcss";
+
+/* Dark mode default, glassmorphic base */
+:root {
+  --glass-bg: rgba(15, 23, 42, 0.72);
+  --glass-border: rgba(148, 163, 184, 0.12);
+  --glass-shadow: 0 8px 32px rgba(0, 0, 0, 0.24);
+  --accent: rgba(99, 102, 241, 0.5);
+  --text-primary: #f1f5f9;
+  --text-secondary: #94a3b8;
+}
+
+html {
+  color-scheme: dark;
+}
+
+body {
+  @apply min-h-screen antialiased;
+  background: radial-gradient(ellipse 80% 60% at 50% 0%, rgba(99, 102, 241, 0.12), transparent 50%),
+    linear-gradient(180deg, #0f172a 0%, #020617 100%);
+  color: var(--text-primary);
+}
+
+/* Skeleton shimmer */
+@keyframes shimmer {
+  0% { opacity: 0.4; }
+  50% { opacity: 0.8; }
+  100% { opacity: 0.4; }
+}
+
+.animate-shimmer {
+  animation: shimmer 1.5s ease-in-out infinite;
+}
